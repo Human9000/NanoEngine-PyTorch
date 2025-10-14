@@ -12,18 +12,19 @@ import math
 
 
 # --- Base Quantization Functions (unchanged) ---
-@torch.no_grad()
+# @torch.no_grad()
 def _fake_q_scale(
         x: torch.Tensor,
         bits_weight: int,
         scale: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert bits_weight in [1, 2, 4, 8], "bits must be 1, 2, 4, or 8"
+    device, dtype = x.device, x.dtype
+
     if bits_weight == 1:
-        device, dtype = x.device, x.dtype
         q = torch.where(x >= 0,
-                        torch.ones_like(x, device=device, dtype=dtype),
-                        -torch.ones_like(x, device=device, dtype=dtype))
+                        torch.ones_like(x),
+                        -torch.ones_like(x))
         mask = (x.abs() <= 1)
     else:
         trunc_x_scale = torch.trunc(x * scale)
@@ -34,18 +35,10 @@ def _fake_q_scale(
         )
         q = q_val / scale
         mask = (q_val == trunc_x_scale)
-    return q, mask
-
-
-def q_scale_k(x: np.ndarray, bits_weight: int, scale_k: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    assert bits_weight in [1, 2, 4, 8], "bits must be 1, 2, 4, or 8"
-    scale = 2.0 ** scale_k
-    if bits_weight == 1:
-        q = np.where(x >= 0, np.ones_like(x), -np.ones_like(x)) * scale
-    else:
-        q_val = np.round(np.clip(x * scale, - 2 ** (bits_weight - 1), 2 ** (bits_weight - 1) - 1))
-        q = q_val / scale
-    return q
+    # if  (x*scale).abs().min() > 127:
+    # print((mask * 1.).mean(),  (x*scale).abs().max(), bits_weight, scale,  (x*scale).abs().min())
+    return q.to(dtype=dtype, device=device), mask.detach()
+    # return x, mask.detach()
 
 
 def q1_pack_bits(q_data: np.ndarray) -> np.ndarray:
@@ -169,7 +162,6 @@ class DyQuantize(nn.Module):
         super().__init__()
         self.lr = lr
         self.bits_len = bits_len
-
         self.rm_dims = None
         if scale is None:
             if shape is None:
@@ -180,37 +172,52 @@ class DyQuantize(nn.Module):
                 if shape[index] > 0:
                     self.rm_dims.pop(index)
                 scale = torch.ones(shape, requires_grad=False)
-            scale *= 2 ** (bits_len - 2)
-            # scale *= 2 ** 5
+            scale *= 2 ** (bits_len - 1)
         self.register_buffer('scale', scale)
         self.upper_bound = 2.0 ** (bits_len - 1)
-        self.rm_dims = None
 
     def to_const(self):
         return ConstQuantize(self.bits_len, self.get_exp_clip_log2_scale())
 
+    @torch.no_grad()
     def _update_scale(self, x):
-        scale = 0.9 * self.upper_bound / x.detach().abs()
+        xabs = x.detach().abs()
         if self.rm_dims is not None:
-            scale = scale.max(dim=self.rm_dim, keepdim=True)
+            xabsmax = torch.amax(xabs, dim=self.rm_dims, keepdim=True)
         else:
-            scale = scale.max()
-        if scale > 1:
-            updated_scale = self.scale * (1 - self.lr) + self.lr * scale
-            self.scale = torch.clamp(updated_scale, max=self.upper_bound)
+            xabsmax = xabs.max()
+        scale = self.upper_bound / xabsmax
+        # scale = 0.9 * scale + 0.1 * 1  # 有0.1的速度 向 1 更新
+        updated_scale = self.scale * (1 - self.lr) + self.lr * scale  # 用 scale 更新
+        updated_scale = torch.clamp(updated_scale, min=2 ** -8, max=2 ** 8)
+        # self.scale = torch.clamp(updated_scale, min=2 ** -6, max=2 ** 6)
+        self.scale = updated_scale
+        # if self.bits_len < 8:
+        #     print(self.scale, scale, xabsmax, self.upper_bound)
 
     def get_scale_k(self):
-        scale_k = torch.log2(self.scale).round()
-        # scale_k = torch.clip(scale_k, 1, self.bits_len - 1).int()
-        return scale_k
+        scale_k = torch.log2(self.scale)
+        scale_k = torch.floor(scale_k)   # 向下取整
+
+        # if self.bits_len < 8:
+        #     print(scale_k)
+        return scale_k.detach()
 
     def get_exp_clip_log2_scale(self):
         return (2 ** self.get_scale_k()).detach()
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        # if self.training:
-        #     self._update_scale(input)
-        return dy_quantize(input, self.bits_len, self.get_exp_clip_log2_scale())
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            self._update_scale(x)
+        q = dy_quantize(x, self.bits_len, self.get_exp_clip_log2_scale())
+        # print(x.max().item(),
+        #       x.min().item(),
+        #       q.max().item(),
+        #       q.min().item(),
+        #       self.bits_len,
+        #       self.get_exp_clip_log2_scale().item(),
+        #       self.get_scale_k().item(), )
+        return q
 
     def extra_repr(self) -> str:
         return f'bits_len={self.bits_len}, lr={self.lr}, shape={list(self.scale.shape)}'

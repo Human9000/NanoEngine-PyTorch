@@ -63,8 +63,6 @@ def get_quantization_info(quantization_gm, target, _quantization_rules):
                     scale_shape = [1, ] * param.ndim
                     scale_shape[c_dim] = param.shape[c_dim]
 
-                print(rules.c_dim, scale_shape)
-
     return bits, lr, scale_shape
 
 
@@ -77,11 +75,18 @@ def graph_module_insert_quantization_nodes(
         # 正则表达式自定义可训练参数的量化规则， 若 channel_dim = None, 则采用 tensor scale，否则采用 channel scale
         default_rules = [
             QRule(r".", bits=8, lr=0.1, c_dim=None),  # 默认规则
-            QRule(r"\.weight$", bits=8, c_dim=0),  # 默认规则
-            QRule(r"\.bias$", bits=8, c_dim=0)  # 默认规则
+            QRule(r"\.weight$", bits=8, c_dim=None),  # 默认规则
+            QRule(r"\.bias$", bits=8, c_dim=None)  # 默认规则
         ]
     if customer_rules is None:
         customer_rules = []
+
+    # 步骤 1: 准备用于存放 get_attr 量化器的 ModuleDict
+    attr_quantize_container_name = "__attr_qs__"
+    if not hasattr(quantization_gm, attr_quantize_container_name):
+        quantization_gm.add_module(attr_quantize_container_name, nn.ModuleDict())
+
+    attr_quantize_container = getattr(quantization_gm, attr_quantize_container_name)
 
     for node in list(quantization_gm.graph.nodes):
         if node.op in ['call_module', 'call_function', 'call_method', 'placeholder', 'get_attr']:
@@ -89,13 +94,39 @@ def graph_module_insert_quantization_nodes(
             # 如果输出会被量化节点使用，则不再额外添加量化节点
             if len(original_users) > 0 and original_users[0].name.endswith("_q"):
                 continue
+
             quantize_target = f"{node.name}_dq"
             quantize_name = f"{node.name}_q"
             bits, lr, scale_shape = get_quantization_info(quantization_gm,
                                                           str(node.target),
                                                           default_rules + customer_rules)
             quantize = DyQuantize(bits, lr, shape=scale_shape)
-            quantization_gm.add_module(quantize_target, quantize)
+            # quantization_gm.add_module(quantize_target, quantize)
+
+            # 步骤 2 & 3: 区分节点类型并定向添加模块
+            if node.op == 'get_attr':
+                # 将量化器添加到 ModuleDict 中
+                attr_quantize_container[quantize_target] = quantize
+
+                # 步骤 4: 调整 call_module 的 target，使其指向 ModuleDict 中的特定 key
+                quantize_target = f"{attr_quantize_container_name}.{quantize_target}"
+            else:
+                # 对于其他类型的节点，行为保持不变
+                quantization_gm.add_module(quantize_target, quantize)
+
+            #
+            # attr_quantizer_container_name = "get_attr_quantizers"
+            # if not hasattr(quantization_gm, attr_quantizer_container_name):
+            #     quantization_gm.add_module(attr_quantizer_container_name, nn.ModuleList())
+            # # 步骤 2 & 3: 区分节点类型并定向添加模块
+            # if node.op == 'get_attr':
+            #     # 步骤 4: 调整 call_module 的 target，使其指向 ModuleList 中的特定索引
+            #     quantize_target = f"{attr_quantizer_container_name}.{quantize_target}"
+            #     # 对于 get_attr 节点，我们将量化器 append 到 ModuleList 中
+            #     attr_quantizer_container.append(quantize)
+            # else:
+            #     quantization_gm.add_module(quantize_target, quantize)
+
             with quantization_gm.graph.inserting_after(node):
                 quantize_node = quantization_gm.graph.call_module(quantize_target, args=(node,))
                 quantize_node.name = quantize_name

@@ -53,7 +53,7 @@ if __name__ == '__main__':
         quantized_gm,
         customer_rules=[
             QRule(r"conv1\.weight", 4, 0.1, 0),
-            # {"pattern": r"0\.conv\.conv1\.weight", "bits": 4, "lr": 0.01, "channel_dim": 0},  # 自定义规则
+            # {"pattern": r"0\.conv\.conv1\.weight", "bits_len": 4, "lr": 0.01, "channel_dim": 0},  # 自定义规则
         ],
     )
 

@@ -7,3 +7,8 @@ from src.scripts.quantize_export import (
     QRule,  # 量化规则
 )
 from src.scripts.quantize_export import shape_inference
+from src.qnn.quantize import (
+    QConv2d,
+    QLinear,
+    QAvgPool2d
+)

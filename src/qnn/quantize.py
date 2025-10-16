@@ -9,6 +9,7 @@ import copy
 
 import numpy as np
 import math
+import pandas as pd
 
 
 # --- Base Quantization Functions (unchanged) ---
@@ -16,15 +17,16 @@ import math
 def _fake_q_scale(
         x: torch.Tensor,
         bits_weight: int,
-        scale: torch.Tensor
+        scale: torch.Tensor,
+        name: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert bits_weight in [1, 2, 4, 8], "bits must be 1, 2, 4, or 8"
+    assert bits_weight in [1, 2, 4, 8], "bits_len must be 1, 2, 4, or 8"
     device, dtype = x.device, x.dtype
 
     if bits_weight == 1:
         q = torch.where(x >= 0,
-                        torch.ones_like(x),
-                        -torch.ones_like(x))
+                        torch.ones_like(x, dtype=torch.float32),
+                        -torch.ones_like(x, dtype=torch.float32)) * scale
         mask = (x.abs() <= 1)
     else:
         trunc_x_scale = torch.trunc(x * scale)
@@ -35,8 +37,7 @@ def _fake_q_scale(
         )
         q = q_val / scale
         mask = (q_val == trunc_x_scale)
-    # if  (x*scale).abs().min() > 127:
-    # print((mask * 1.).mean(),  (x*scale).abs().max(), bits_weight, scale,  (x*scale).abs().min())
+
     return q.to(dtype=dtype, device=device), mask.detach()
     # return x, mask.detach()
 
@@ -101,14 +102,14 @@ def q_packed_bits(
 
 class DyQuantizedWrapper(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, tensor, bit_len, scale) -> torch.Tensor:
-        q_tensor, q_mask = _fake_q_scale(tensor, bit_len, scale)
+    def forward(ctx, tensor, bit_len, scale, name) -> torch.Tensor:
+        q_tensor, q_mask = _fake_q_scale(tensor, bit_len, scale, name)
         ctx.q_mask = q_mask
         return q_tensor
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> Tuple[Any, ...]:
-        return grad_output * ctx.q_mask, None, None
+        return grad_output * ctx.q_mask, None, None, None
 
 
 class ConstQuantizedWrapper(torch.autograd.Function):
@@ -116,10 +117,12 @@ class ConstQuantizedWrapper(torch.autograd.Function):
     def forward(ctx, tensor, bit_len, scale: torch.Tensor) -> torch.Tensor:
         q_tensor, q_mask = _fake_q_scale(tensor, bit_len, scale)
         ctx.q_mask = q_mask
+        ctx.bit_len = bit_len
         return q_tensor
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> Tuple[Any, ...]:
+
         return grad_output * ctx.q_mask, None, None
 
     @staticmethod
@@ -145,8 +148,8 @@ class ConstQuantizedWrapper(torch.autograd.Function):
         return q_tensor
 
 
-def dy_quantize(tensor, bit_len, scale):
-    return DyQuantizedWrapper.apply(tensor, bit_len, scale)
+def dy_quantize(tensor, bit_len, scale, name):
+    return DyQuantizedWrapper.apply(tensor, bit_len, scale, name)
 
 
 def const_quantize(tensor, bit_len, scale):
@@ -154,53 +157,75 @@ def const_quantize(tensor, bit_len, scale):
 
 
 class DyQuantize(nn.Module):
-    def __init__(self, bits_len: int = 8,
+    def __init__(self,
+                 bits_len: int = 8,
                  lr: float = 0.1,
                  scale: torch.Tensor = None,
-                 shape: Tuple[int] = None,
+                 in_shape: Tuple[int] = None,
+                 c_out_dim: int = None,
+                 use_channel_scale: bool = False,
+                 name="",
                  ):
         super().__init__()
         self.lr = lr
         self.bits_len = bits_len
-        self.rm_dims = None
-        if scale is None:
-            if shape is None:
-                scale = torch.ones(1, requires_grad=False)
-            else:
-                self.rm_dims = list(range(len(shape)))
-                index = np.argmax(shape)
-                if shape[index] > 0:
-                    self.rm_dims.pop(index)
-                scale = torch.ones(shape, requires_grad=False)
-            scale *= 2 ** (bits_len - 1)
-        self.register_buffer('scale', scale)
+        self.channel_max_dims = None
+        self.name = name
+        self.scale_shape = [1, ]
+        self.in_shape = in_shape
+        self.use_channel_scale = use_channel_scale
+        self.c_out_dim = c_out_dim
+        channel = 1
         self.upper_bound = 2.0 ** (bits_len - 1)
+        if scale is None:
+            if in_shape is not None:
+                for i, v in enumerate(in_shape):
+                    if i != c_out_dim:
+                        channel *= v
+                if c_out_dim is not None:
+                    if use_channel_scale:
+                        self.scale_shape = [1, ] * len(in_shape)
+                        self.scale_shape[c_out_dim] = in_shape[c_out_dim]
+                        self.channel_max_dims = [i for i in range(len(in_shape)) if i != c_out_dim]
+            else:
+                self.in_shape = []
+
+            scale = torch.ones(self.scale_shape, requires_grad=False)
+            if bits_len == 1:
+                self.upper_bound = 1
+                scale *= channel ** -0.5
+            else:
+                scale *= 2 ** (bits_len - 1)
+        self.register_buffer('scale', scale)
+
+        self.count = 0
 
     def to_const(self):
         return ConstQuantize(self.bits_len, self.get_exp_clip_log2_scale())
 
     @torch.no_grad()
     def _update_scale(self, x):
+        # if self.bits_len == 1:
+        #     return
         xabs = x.detach().abs()
-        if self.rm_dims is not None:
-            xabsmax = torch.amax(xabs, dim=self.rm_dims, keepdim=True)
+        if self.use_channel_scale is not None:
+            xabsmax = torch.amax(xabs, dim=self.channel_max_dims, keepdim=True)
         else:
             xabsmax = xabs.max()
-        scale = self.upper_bound / xabsmax
-        # scale = 0.9 * scale + 0.1 * 1  # 有0.1的速度 向 1 更新
-        updated_scale = self.scale * (1 - self.lr) + self.lr * scale  # 用 scale 更新
-        updated_scale = torch.clamp(updated_scale, min=2 ** -8, max=2 ** 8)
-        # self.scale = torch.clamp(updated_scale, min=2 ** -6, max=2 ** 6)
+
+        if self.bits_len == 1:
+            updated_scale = self.scale
+            # print(updated_scale)
+        else:
+            scale = self.upper_bound / xabsmax
+            scale[scale > 2] *= 0.9  # scale 过大则提供一个向下移动的方向
+            scale[scale < 0.5] /= 0.9  # scale 过小则提供一个向上移动的方向
+            updated_scale = self.scale * (1 - self.lr) + self.lr * scale  # 用 scale 更新
         self.scale = updated_scale
-        # if self.bits_len < 8:
-        #     print(self.scale, scale, xabsmax, self.upper_bound)
 
     def get_scale_k(self):
         scale_k = torch.log2(self.scale)
-        scale_k = torch.floor(scale_k)   # 向下取整
-
-        # if self.bits_len < 8:
-        #     print(scale_k)
+        scale_k = torch.floor(scale_k)  # 向下取整
         return scale_k.detach()
 
     def get_exp_clip_log2_scale(self):
@@ -209,18 +234,31 @@ class DyQuantize(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.training:
             self._update_scale(x)
-        q = dy_quantize(x, self.bits_len, self.get_exp_clip_log2_scale())
-        # print(x.max().item(),
-        #       x.min().item(),
-        #       q.max().item(),
-        #       q.min().item(),
-        #       self.bits_len,
-        #       self.get_exp_clip_log2_scale().item(),
-        #       self.get_scale_k().item(), )
+        q = dy_quantize(x, self.bits_len, self.get_exp_clip_log2_scale(), self.name)
+
+        self.count += 1
+
+        if self.bits_len == 8:
+            s0 = self.scale.item()
+            s = self.get_exp_clip_log2_scale().item()
+            # _fake_q_scale(x, 8, self.acc.get_exp_clip_log2_scale(), )
+            if self.count % 100 == 0:
+                print(
+                    self.name,
+                    x.abs().max().item(),
+                    x.abs().max().item() * s,
+                    s0,
+                    s,
+                )
         return q
 
     def extra_repr(self) -> str:
-        return f'bits_len={self.bits_len}, lr={self.lr}, shape={list(self.scale.shape)}'
+        return f'bits_len={self.bits_len}, ' \
+               f'lr={self.lr}, ' \
+               f'in_shape={self.in_shape}, ' \
+               f'scale_shape={self.scale_shape}, ' \
+               f'c_out_dim={self.c_out_dim}, ' \
+               f'USE_CS={self.use_channel_scale}, '
 
 
 class ConstQuantize(nn.Module):
@@ -232,7 +270,6 @@ class ConstQuantize(nn.Module):
 
     def get_scale_k(self):
         scale_k = torch.log2(self.scale).round()
-        scale_k = torch.clip(scale_k, 1, self.bits_len - 1).int()
         return scale_k
 
     def get_scale(self):
@@ -248,3 +285,100 @@ class ConstQuantize(nn.Module):
 
     def extra_repr(self) -> str:
         return f'bits_len={self.bits_len}, shape={list(self.scale.shape)}'
+
+
+class QLinear(nn.Linear):
+    def __init__(self,
+                 bits,
+                 lr,
+                 in_features,
+                 out_features,
+                 bias=True,
+                 ):
+        super().__init__(in_features, out_features, bias)
+        self.qweight = DyQuantize(bits, lr, None, [out_features, in_features], 0, name="qweight")
+        self.qbias = DyQuantize(8, 0.1, None, [1, ], name="qbias")
+        self.acc = DyQuantize(8, 0.1, None, [1, ], name="qbias")
+        self.bits = bits
+
+    def forward(self, x):
+        weight = self.qweight(self.weight)
+        bias = None
+        if self.bias is not None:
+            bias = self.qbias(self.bias)
+        y0 = F.linear(x, weight, bias)
+        y = self.acc(y0)
+        return y
+
+
+class QConv2d(nn.Conv2d):
+    def __init__(self,
+                 bits, lr,
+                 in_channels: int,
+                 out_channels: int,
+                 kernel_size,
+                 stride=1,
+                 padding=0,
+                 dilation=1,
+                 groups: int = 1,
+                 bias: bool = True,
+                 padding_mode: str = 'zeros',  # TODO: refine this type
+                 device=None,
+                 dtype=None,
+                 ):
+        super().__init__(in_channels,
+                         out_channels,
+                         kernel_size,
+                         stride,
+                         padding,
+                         dilation,
+                         groups,
+                         bias,
+                         padding_mode,
+                         device,
+                         dtype,
+                         )
+        self.qweight = DyQuantize(bits, lr, None, [1, ], name="qweight")
+        self.qbias = DyQuantize(8, 0.1, None, [1, ], name="qbias")
+        self.acc = DyQuantize(8, 0.1, None, [1, ], name="qbias")
+
+    def forward(self, x):
+        weight = self.qweight(self.weight)
+        bias = None
+        if self.bias is not None:
+            bias = self.qbias(self.bias)
+        # print(weight.shape, x.shape)
+        y = F.conv2d(x, weight, bias,
+                     self.stride,
+                     self.padding,
+                     self.dilation,
+                     self.groups
+                     )
+
+        return self.acc(y)
+
+
+class QAvgPool2d(nn.AvgPool2d):
+    def __init__(self,
+                 kernel_size, stride=None, padding=0,
+                 ceil_mode: bool = False, count_include_pad: bool = True, divisor_override=None
+                 ):
+        super().__init__(kernel_size,
+                         stride,
+                         padding,
+                         ceil_mode,
+                         count_include_pad,
+                         divisor_override,
+                         )
+        self.acc = DyQuantize(8, 0.1, None, [1, ], name="qbias")
+
+    def forward(self, x):
+        y = F.avg_pool2d(x,
+                         self.kernel_size,
+                         self.stride,
+                         self.padding,
+                         self.ceil_mode,
+                         self.count_include_pad,
+                         self.divisor_override,
+                         )
+        return self.acc(y)

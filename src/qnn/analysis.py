@@ -72,10 +72,10 @@ class TensorIR:
         # 量化
         raw_data = self.data
         if self.qCBits != None:
-            # q_data, mask = q_scale_k(self.data, self.bits, self.qCBits)
+            # q_data, mask = q_scale_k(self.data, self.bits_len, self.qCBits)
             q_data = q_scale_k(self.data, self.bits, self.qCBits)
         else:
-            # q_data, mask = q_scale_k(self.data, self.bits, np.array(self.qTBits))
+            # q_data, mask = q_scale_k(self.data, self.bits_len, np.array(self.qTBits))
             q_data = q_scale_k(self.data, self.bits, np.array(self.qTBits))
 
         q_packed_bits(q_data, self.bits)  # 将量化数据打包成 int8
@@ -443,7 +443,7 @@ def make_init_const_tensor(init_const_tensor):  # 初始化时期的常量张量
         #     data=np_array,
         #     dims=shape,
         #     shape_type=shape_type,
-        #     bits=8,
+        #     bits_len=8,
         #     qTBits=0,
         #     qCBits=None,
         #     incremental_memory_len=0,

@@ -15,9 +15,10 @@ from typing import Optional
 @dataclass
 class QRule:
     pattern: str  # 正则表达式
-    bits: Optional[int] = field(default=None)  # 量化位宽
+    bits_len: Optional[int] = field(default=None)  # 量化位宽
     lr: Optional[float] = field(default=None)  # 学习率
-    c_dim: Optional[int] = field(default=None)  # 通道维度
+    c_out_dim_index: Optional[int] = field(default=None)  # 通道维度
+    use_channel_scale: bool = field(default=False)  # 是否使用通道级别缩放
 
     def __post_init__(self):
         # 编译一次，后面匹配更快
@@ -42,6 +43,10 @@ class DecomposeTracer(Tracer):
             "torch.nn.modules.upsampling",
         ]:
             return False
+        if m.__module__ in [
+            "src.qnn.quantize"
+        ]:
+            return True
         # 对于其他 nn 模块，保持默认行为
         super().is_leaf_module(m, module_qualified_name)
 
@@ -51,32 +56,34 @@ def get_quantization_info(quantization_gm, target, _quantization_rules):
     lr = 0.1
     scale_shape = None
     c_dim = None  # 默认 channel dim 为 None，即不采用通道级别缩放，只采用tensor级别缩放
+    use_channel_scale = False
+
+    if target in quantization_gm.state_dict().keys():
+        scale_shape = quantization_gm.get_parameter(target).shape
+
     if _quantization_rules is not None:  # 自定义了节点的量化信息
         # 遍历查找当前节点是否在自定义的节点里面
         for rules in _quantization_rules:
             if re.search(rules.pattern, target) is not None:
-                bits = rules.get("bits", bits)
-                c_dim = rules.get("c_dim", c_dim)
+                bits = rules.get("bits_len", bits)
+                c_dim = rules.get("c_out_dim_index", c_dim)
                 lr = rules.get("lr", lr)
-                if c_dim is not None:
-                    param = quantization_gm.get_parameter(target)
-                    scale_shape = [1, ] * param.ndim
-                    scale_shape[c_dim] = param.shape[c_dim]
+                use_channel_scale = rules.get("use_channel_scale")
 
-    return bits, lr, scale_shape
+    return bits, lr, scale_shape, c_dim, use_channel_scale
 
 
 def graph_module_insert_quantization_nodes(
         quantization_gm: GraphModule,
-        customer_rules: Optional[List[QRule]] = None,  # [[r"0\.conv\.conv\d+\.weight", {"bits": 4, "lr": 0.01, "channel_dim": 0}],],  # 用户自定义规则
+        customer_rules: Optional[List[QRule]] = None,  # [[r"0\.conv\.conv\d+\.weight", {"bits_len": 4, "lr": 0.01, "channel_dim": 0}],],  # 用户自定义规则
         default_rules: Optional[List[QRule]] = None,  # [ ,],  # 用户自定义规则
 ):
     if default_rules is None:
         # 正则表达式自定义可训练参数的量化规则， 若 channel_dim = None, 则采用 tensor scale，否则采用 channel scale
         default_rules = [
-            QRule(r".", bits=8, lr=0.1, c_dim=None),  # 默认规则
-            QRule(r"\.weight$", bits=8, c_dim=None),  # 默认规则
-            QRule(r"\.bias$", bits=8, c_dim=None)  # 默认规则
+            QRule(r".", bits_len=8, lr=0.1, ),  # 默认规则
+            QRule(r"\.weight$",  bits_len=8,),  # 默认规则
+            QRule(r"\.bias$",  bits_len=8, )  # 默认规则
         ]
     if customer_rules is None:
         customer_rules = []
@@ -97,10 +104,16 @@ def graph_module_insert_quantization_nodes(
 
             quantize_target = f"{node.name}_dq"
             quantize_name = f"{node.name}_q"
-            bits, lr, scale_shape = get_quantization_info(quantization_gm,
-                                                          str(node.target),
-                                                          default_rules + customer_rules)
-            quantize = DyQuantize(bits, lr, shape=scale_shape)
+            bits, lr, scale_shape, c_dim,use_channel_scale = get_quantization_info(quantization_gm,
+                                                                 str(node.target),
+                                                                 default_rules + customer_rules)
+            print(quantize_target, scale_shape)
+            quantize = DyQuantize(bits,
+                                  lr,
+                                  in_shape=scale_shape,
+                                  c_out_dim=c_dim,
+                                  use_channel_scale = use_channel_scale,
+                                  name=quantize_target)
             # quantization_gm.add_module(quantize_target, quantize)
 
             # 步骤 2 & 3: 区分节点类型并定向添加模块
@@ -147,7 +160,8 @@ def remove_quantization_nodes(quantized_gm: GraphModule) -> GraphModule:
         # 判断当前节点是否是一个调用 DyQuantize 模块的节点
         if node.op == 'call_module':
             # 通过 node.target 获取模块的名称，再从模型中获取模块实例
-            module = getattr(quantized_gm, node.target)
+            module = quantized_gm.get_submodule(node.target)
+            # module = getattr(quantized_gm, node.target)
             if isinstance(module, DyQuantize):
                 # 获取量化节点的输入节点 (它只有一个参数)
                 input_node = node.args[0]
@@ -187,9 +201,10 @@ def ex_quantize_model_fully_encapsulated(model: GraphModule):
             dq_name = node.target
             cq_name = dq_name[:-2] + "cq"
             dq_module = model.get_submodule(dq_name)
-            model.add_module(cq_name, dq_module.to_const())
+            model.add_submodule(cq_name, dq_module.to_const())
+            model.delete_submodule(dq_name)
             node.target = cq_name
-            delattr(model, dq_name)
+            # delattr(model, dq_name)
 
     # 4. 别忘了重新生成代码
     model.graph.lint()
@@ -300,7 +315,7 @@ def translate_model_to_GraphModule(model: nn.Module) -> GraphModule:
 #         quantized_gm,
 #         customer_rules=[
 #             QRule(r"conv1\.weight", 4, 0.01, 0),
-#             # {"pattern": r"0\.conv\.conv1\.weight", "bits": 4, "lr": 0.01, "channel_dim": 0},  # 自定义规则
+#             # {"pattern": r"0\.conv\.conv1\.weight", "bits_len": 4, "lr": 0.01, "channel_dim": 0},  # 自定义规则
 #         ]
 #     )
 #

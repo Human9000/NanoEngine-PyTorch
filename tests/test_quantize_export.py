@@ -20,8 +20,12 @@ if __name__ == '__main__':
             self.conv1 = nn.Conv2d(3, 16, 3, stride=1, padding=0)
             self.conv2 = nn.Conv2d(16, 16, 1, stride=1, padding=0)
 
+            self.bn = nn.BatchNorm2d(16)
+
         def forward(self, x):
-            return self.conv2(self.conv1(x))
+            x = self.conv2(self.conv1(x))
+            y = self.bn(x)
+            return y
 
 
     class ComprehensiveModel(nn.Module):
@@ -29,7 +33,6 @@ if __name__ == '__main__':
             super().__init__()
             self.conv = Conv2()
             self.custom_param = nn.Parameter(torch.randn(1))
-
         def forward(self, x):
             x1 = self.conv(x)
             x = x1 + self.custom_param + torch.randn(1) + 2
@@ -52,7 +55,8 @@ if __name__ == '__main__':
     quantized_gm = graph_module_insert_quantization_nodes(
         quantized_gm,
         customer_rules=[
-            QRule(r"conv1\.weight", 4, 0.1, 0),
+            QRule(r"conv1\.weight", 4, 0.1, None, False),
+            QRule(r"conv2\.weight", 1, 0.1, 0, False),
             # {"pattern": r"0\.conv\.conv1\.weight", "bits_len": 4, "lr": 0.01, "channel_dim": 0},  # 自定义规则
         ],
     )
@@ -65,6 +69,8 @@ if __name__ == '__main__':
 
     print("\n--- 量化后的图结构 (最终的清晰版本!) ---")
     quantized_gm.graph.print_tabular()
+
+    exit(0)
 
     gm_back = remove_quantization_nodes(quantized_gm)
     print("\n--- 反量化后的模型结构 (完全封装) ---")

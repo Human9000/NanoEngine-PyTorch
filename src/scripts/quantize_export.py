@@ -15,12 +15,19 @@ from typing import Optional
 @dataclass
 class QRule:
     pattern: str  # 正则表达式
-    bits_len: Optional[int] = field(default=None)  # 量化位宽
-    lr: Optional[float] = field(default=None)  # 学习率
+    bits_len: int = field(default=8)  # 量化位宽
+    lr: float = field(default=0.1)  # 学习率
     c_out_dim_index: Optional[int] = field(default=None)  # 通道维度
     use_channel_scale: bool = field(default=False)  # 是否使用通道级别缩放
 
     def __post_init__(self):
+        if self.bits_len == 1:
+            assert self.c_out_dim_index is not None, "1 bit 的 通道维度索引不能为None"
+        if self.use_channel_scale:
+            assert self.c_out_dim_index is not None, "使用通道缩放因子 的 通道维度索引不能为None"
+        if self.bits_len == 1:
+            self.use_channel_scale = False  # 1 bit quantization 不支持通道级别缩放
+
         # 编译一次，后面匹配更快
         if isinstance(self.pattern, str):
             self.pattern = re.compile(self.pattern)
@@ -35,6 +42,10 @@ class QRule:
 # 创建一个自定义的 Tracer
 class DecomposeTracer(Tracer):
     def is_leaf_module(self, m: nn.Module, module_qualified_name: str) -> bool:
+        if m.__module__ in ["torch.nn.modules.batchnorm"]:
+            m._check_input_dim = lambda *arg: True  # 忽略 BN 的输入维度检查
+            return False
+
         # 指定需要分解的模块（里面包含可训练张量的都需要继续分解）
         if m.__module__ in [
             "torch.nn.modules.conv",
@@ -54,12 +65,34 @@ class DecomposeTracer(Tracer):
 def get_quantization_info(quantization_gm, target, _quantization_rules):
     bits = 8
     lr = 0.1
-    scale_shape = None
+    scale_shape = [1, ]
     c_dim = None  # 默认 channel dim 为 None，即不采用通道级别缩放，只采用tensor级别缩放
     use_channel_scale = False
 
     if target in quantization_gm.state_dict().keys():
-        scale_shape = quantization_gm.get_parameter(target).shape
+        if '.' in target:
+            *target_module_path_list, target_name = target.rsplit('.', 1)
+            target_module_path = '.'.join(target_module_path_list)
+        else:
+            # 如果 target 是顶层参数/buffer，例如 '_tensor_constant0'
+            target_module_path = ''
+            target_name = target
+
+            # 2. 获取包含该张量的直接父模块
+        target_module = quantization_gm.get_submodule(target_module_path)
+        # 1. 安全地获取属性
+        target_attr = getattr(target_module, target_name, None)
+
+        if target_attr is not None:
+            # 2. 检查属性是否是张量类型 (nn.Parameter 或 Tensor/Buffer)
+            if isinstance(target_attr, (torch.nn.Parameter, torch.Tensor)):
+                scale_shape = target_attr.shape
+            else:
+                # 如果不是张量类型，可能需要跳过或抛出更清晰的错误
+                raise TypeError(f"Target '{target}' is not a parameter or tensor: {type(target_attr)}")
+        else:
+            # target 不在 state_dict 或 Module 属性中
+            raise AttributeError(f"Module has no attribute '{target}'")
 
     if _quantization_rules is not None:  # 自定义了节点的量化信息
         # 遍历查找当前节点是否在自定义的节点里面
@@ -79,11 +112,11 @@ def graph_module_insert_quantization_nodes(
         default_rules: Optional[List[QRule]] = None,  # [ ,],  # 用户自定义规则
 ):
     if default_rules is None:
-        # 正则表达式自定义可训练参数的量化规则， 若 channel_dim = None, 则采用 tensor scale，否则采用 channel scale
+        # 正则表达式自定义可训练参数的量化规则， 若 channel_dim = None, 则采用 tensor init_scale，否则采用 channel init_scale
         default_rules = [
             QRule(r".", bits_len=8, lr=0.1, ),  # 默认规则
-            QRule(r"\.weight$",  bits_len=8,),  # 默认规则
-            QRule(r"\.bias$",  bits_len=8, )  # 默认规则
+            QRule(r"\.weight$", bits_len=8, ),  # 默认规则
+            QRule(r"\.bias$", bits_len=8, )  # 默认规则
         ]
     if customer_rules is None:
         customer_rules = []
@@ -102,19 +135,30 @@ def graph_module_insert_quantization_nodes(
             if len(original_users) > 0 and original_users[0].name.endswith("_q"):
                 continue
 
+            # if "running_mean" in node.name or "running_var" in node.name:
+            #     continue
+
+            # if "bn_bias" in node.name:
+            #     continue
+
+            if "running_mean" in node.name:
+                continue
+
+            # if "bn_weight" in node.name:
+            #     continue
+
             quantize_target = f"{node.name}_dq"
             quantize_name = f"{node.name}_q"
-            bits, lr, scale_shape, c_dim,use_channel_scale = get_quantization_info(quantization_gm,
-                                                                 str(node.target),
-                                                                 default_rules + customer_rules)
-            print(quantize_target, scale_shape)
+            bits, lr, scale_shape, c_dim, use_channel_scale = get_quantization_info(quantization_gm,
+                                                                                    str(node.target),
+                                                                                    default_rules + customer_rules)
+
             quantize = DyQuantize(bits,
                                   lr,
                                   in_shape=scale_shape,
                                   c_out_dim=c_dim,
-                                  use_channel_scale = use_channel_scale,
+                                  use_channel_scale=use_channel_scale,
                                   name=quantize_target)
-            # quantization_gm.add_module(quantize_target, quantize)
 
             # 步骤 2 & 3: 区分节点类型并定向添加模块
             if node.op == 'get_attr':
@@ -126,19 +170,6 @@ def graph_module_insert_quantization_nodes(
             else:
                 # 对于其他类型的节点，行为保持不变
                 quantization_gm.add_module(quantize_target, quantize)
-
-            #
-            # attr_quantizer_container_name = "get_attr_quantizers"
-            # if not hasattr(quantization_gm, attr_quantizer_container_name):
-            #     quantization_gm.add_module(attr_quantizer_container_name, nn.ModuleList())
-            # # 步骤 2 & 3: 区分节点类型并定向添加模块
-            # if node.op == 'get_attr':
-            #     # 步骤 4: 调整 call_module 的 target，使其指向 ModuleList 中的特定索引
-            #     quantize_target = f"{attr_quantizer_container_name}.{quantize_target}"
-            #     # 对于 get_attr 节点，我们将量化器 append 到 ModuleList 中
-            #     attr_quantizer_container.append(quantize)
-            # else:
-            #     quantization_gm.add_module(quantize_target, quantize)
 
             with quantization_gm.graph.inserting_after(node):
                 quantize_node = quantization_gm.graph.call_module(quantize_target, args=(node,))
@@ -233,7 +264,6 @@ def sanitize_onnx_names(model: onnx.ModelProto) -> Dict[str, str]:
         for index, out_name in enumerate(node.output):
             out_tensor_map[out_name] = f"{new_node_name}_o{index}"
 
-    # print(out_tensor_map)
     def fix(name: str) -> str:
         if name in tbl:
             return tbl[name]
@@ -271,110 +301,3 @@ def sanitize_onnx_names(model: onnx.ModelProto) -> Dict[str, str]:
 
 def translate_model_to_GraphModule(model: nn.Module) -> GraphModule:
     return GraphModule(model, DecomposeTracer().trace(model))
-
-#
-# # --- Example Usage ---
-# if __name__ == '__main__':
-#     class Conv2(nn.Module):
-#         def __init__(self):
-#             super().__init__()
-#             self.conv1 = nn.Conv2d(3, 16, 3, stride=1, padding=0)
-#             self.conv2 = nn.Conv2d(16, 16, 1, stride=1, padding=0)
-#
-#         def forward(self, x):
-#             return self.conv2(self.conv1(x))
-#
-#
-#     class ComprehensiveModel(nn.Module):
-#         def __init__(self):
-#             super().__init__()
-#             # self.conv = nn.Conv1d(3, 16, 3, stride=2, padding=0)
-#             self.conv = Conv2()
-#             self.custom_param = nn.Parameter(torch.randn(1))
-#
-#         def forward(self, x):
-#             x1 = self.conv(x)
-#             x = x1 + self.custom_param + torch.randn(1) + 2
-#             x = F.relu(x) + x
-#             return x
-#
-#
-#     model = nn.Sequential(ComprehensiveModel())
-#
-#     print("--- 原始模型 ---")
-#     print(model)
-#     model.forward(torch.randn(1, 3, 8, 8))
-#     # 使用自定义的 DecomposeTracer 展开 model 的 graph 结构
-#     quantized_gm = GraphModule(model, DecomposeTracer().trace(model))
-#     print("--- 图结构模型 ---")
-#     print(quantized_gm)
-#     print(list(quantized_gm.state_dict().keys()))
-#
-#     # 2. Trace the model and insert quantization nodes
-#     quantized_gm = graph_module_insert_quantization_nodes(
-#         quantized_gm,
-#         customer_rules=[
-#             QRule(r"conv1\.weight", 4, 0.01, 0),
-#             # {"pattern": r"0\.conv\.conv1\.weight", "bits_len": 4, "lr": 0.01, "channel_dim": 0},  # 自定义规则
-#         ]
-#     )
-#
-#     print("\n--- 量化后的模型结构 (完全封装) ---")
-#     print(quantized_gm)
-#
-#     print("\n--- 量化后的模型代码 ---")
-#     print(quantized_gm.code)
-#
-#     print("\n--- 量化后的图结构 (最终的清晰版本!) ---")
-#     quantized_gm.graph.print_tabular()
-#
-#     gm_back = remove_quantization_nodes(quantized_gm)
-#     print("\n--- 反量化后的模型结构 (完全封装) ---")
-#     print(gm_back)
-#
-#     print("\n--- 反量化后的模型代码 ---")
-#     print(gm_back.code)
-#
-#     print("\n--- 反量化后的图结构 (最终的清晰版本!) ---")
-#     gm_back.graph.print_tabular()
-#
-#     input_tensor = torch.randn(1, 3, 8, 8)
-#     try:
-#         quantized_gm.train()
-#         output = quantized_gm(input_tensor)
-#         print("\n最终模型前向传播成功!")
-#         print("输出形状:", output.shape)
-#     except Exception as e:
-#         import traceback
-#
-#         print(f"\n前向传播时发生错误: {e}")
-#         traceback.print_exc()
-#
-#     # 导出 onnx
-#     try:
-#         ex_quantized_gm = ex_quantize_model_fully_encapsulated(quantized_gm.eval())
-#         print("\n--- 量化后的导出的模型结构 ---")
-#         print(ex_quantized_gm)
-#         ex_quantized_gm.graph.print_tabular()
-#         torch.onnx.export(ex_quantized_gm,
-#                           input_tensor,
-#                           "../../onnx_model/quantized_model.onnx",
-#                           input_names=["input"],
-#                           output_names=["output"],
-#                           dynamic_axes={"input": {0: "N"},
-#                                         "output": {0: "N"}}
-#                           )
-#         # 1. 载入模型
-#         model = onnx.load("../../onnx_model/quantized_model.onnx")
-#         # 2. 清理名字
-#         sanitize_onnx_names(model)
-#         # 3. 推理所有节点的形状
-#         inferred = shape_inference.infer_shapes(model)
-#         # 4. 覆盖原模型或另存
-#         onnx.save(inferred, '../../onnx_model/quantized_model.onnx')
-#         print("\nONNX模型导出成功!")
-#     except Exception as e:
-#         import traceback
-#
-#         print(f"\nONNX导出时发生错误: {e}")
-#         traceback.print_exc()

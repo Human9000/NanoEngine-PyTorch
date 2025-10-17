@@ -209,21 +209,23 @@ class DyQuantize(nn.Module):
     @torch.no_grad()
     def _update_scale(self, x):
         xabs = x.detach().abs()
+
         if self.use_channel_scale is not False:
-            xabsmax = torch.amax(xabs, dim=self.channel_max_dims, keepdim=True)
+            if len(self.channel_max_dims) > 0:
+                xabsmax = torch.amax(xabs, dim=self.channel_max_dims, keepdim=True)
+            else:
+                xabsmax = xabs
         else:
             xabsmax = xabs.max()
 
-        if xabsmax < 1e-6:
-            updated_scale = self.scale
-        elif self.bits_len == 1:
+        if self.bits_len == 1:
             scale = xabsmax
-            updated_scale = scale * self.lr + (1 - self.lr) * self.scale   # 用 init_scale 更新
         else:
             scale = self.upper_bound / xabsmax
-            scale[scale > 2] *= 0.9  # init_scale 过大则提供一个向下移动的方向
-            scale[scale < 0.5] /= 0.9  # init_scale 过小则提供一个向上移动的方向
-            updated_scale = self.scale * (1 - self.lr) + self.lr * scale  # 用 init_scale 更新
+        scale[scale > 2] *= 0.9  # init_scale 过大则提供一个向下移动的方向
+        scale[scale < 0.5] /= 0.9  # init_scale 过小则提供一个向上移动的方向
+        scale[xabsmax < 1e-6] = self.scale  # xabsmax 过小则保持不变
+        updated_scale = self.scale * (1 - self.lr) + self.lr * scale  # 用 init_scale 更新
 
         if self.scale.shape != updated_scale.shape:
             print("=====", self.name, self.scale.shape, updated_scale.shape, xabsmax.shape)

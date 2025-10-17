@@ -15,6 +15,10 @@
 11. 量化模型分析
 12. 增量流式维度推理   √
 
+## install 
+```shell
+pip install git+ssh://git@10.10.10.202:2222/AlgorithmBackendFrontend/NanoEngine-Pytorch.git@v1.0.1-beta.1
+```
 
 ## v1.0.0-alpha.1
 Initial commit

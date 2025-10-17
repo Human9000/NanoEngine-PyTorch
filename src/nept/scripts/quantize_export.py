@@ -25,9 +25,7 @@ class QRule:
             assert self.c_out_dim_index is not None, "1 bit 的 通道维度索引不能为None"
         if self.use_channel_scale:
             assert self.c_out_dim_index is not None, "使用通道缩放因子 的 通道维度索引不能为None"
-        if self.bits_len == 1:
-            self.use_channel_scale = False  # 1 bit quantization 不支持通道级别缩放
-
+         
         # 编译一次，后面匹配更快
         if isinstance(self.pattern, str):
             self.pattern = re.compile(self.pattern)

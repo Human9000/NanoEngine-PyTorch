@@ -12,7 +12,7 @@ import pandas as pd
 from onnx import shape_inference
 from dataclasses import dataclass, field
 from typing import List, Any, Dict
-from .quantizer import q_scale_k, q_packed_bits
+from nept.qnn.quantize import _fake_q_scale, q_packed_bits
 
 
 # --- 新增: 定义中间表示 (IR) 的数据结构 ---
@@ -329,6 +329,16 @@ def simulation_run_analysis(input_name_s, output_name_s, runtime_tensor_s, runti
         "Relu": _simulate_simple_node,
         "Shape": _simulate_simple_node,
         "ConstantOfShape": _simulate_simple_node,
+        "Gemm": _simulate_simple_node,
+        "Split": _simulate_simple_node,
+        "Sigmoid": _simulate_simple_node,
+        "Tanh": _simulate_simple_node,
+        "Sub": _simulate_simple_node,
+        "Unsqueeze": _simulate_simple_node,
+        "Concat": _simulate_simple_node,
+        "Slice": _simulate_simple_node,
+        "Gather": _simulate_simple_node,
+        "Reshape": _simulate_simple_node,
         # 可以根据需要添加更多算子的模拟器，例如 Add, MaxPool 等
     }
     # 模拟运行图
@@ -425,7 +435,7 @@ def make_init_const_tensor(init_const_tensor):  # 初始化时期的常量张量
     print("\n// init const tensor")
     for tensor_name, tensor_info in init_const_tensor.items():
         dtype_list = ['UNDEFINED', 'F32', 'U8', 'I8', 'U16', 'I16', 'I32', 'I64', 'STRING', 'BOOL', 'F16', 'F64', 'U32', 'U64', 'COMPLEX64', 'COMPLEX128', 'BF16']
-        map = {"F32": 'little_float_32', "I8": "int8_t"}  # 小端 四字节 float 列表
+        map = {"F32": 'little_float_32', "I8": "int8_t", "I64": "int64_t"}  # 小端 四字节 float 列表
         dtype = dtype_list[tensor_info.data_type]
         raw_data = tensor_info.raw_data
         # np_array = numpy_helper.to_array(tensor_info)
@@ -609,6 +619,8 @@ def make_call_node(init_node, runtime_node):
 
 
 def main():
+
+    path = r'D:\2025\NanoEngine\NanoEngine-Pytorch\onnx_model\quantized_model.onnx'
     (
         graph,
         init_const_tensor,
@@ -618,7 +630,7 @@ def main():
         runtime_node,
         input_name_s,
         output_name_s,
-    ) = parse_onnx_file("../onnx_model/quantized_model.onnx")
+    ) = parse_onnx_file(path)
 
     # 2d tensor
     tensor_states = {}

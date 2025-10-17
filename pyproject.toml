@@ -12,7 +12,7 @@ build-backend = "setuptools.build_meta"
 # 替代了 setup.py 中的大部分参数。
 [project]
 name = "nept"  # 你的包在 pip 上的名称
-version = "1.0.0"          # 当前版本号 (后续应根据 MAJOR.MINOR.PATCH 规则更新)
+version = "1.0.1"          # 当前版本号 (后续应根据 MAJOR.MINOR.PATCH 规则更新)
 description = "A comprehensive quantization engine for PyTorch."
 readme = "README.md"       # 指向项目说明文件
 requires-python = ">=3.8"  # 支持的最低 Python 版本

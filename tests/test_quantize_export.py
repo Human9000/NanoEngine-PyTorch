@@ -55,8 +55,9 @@ if __name__ == '__main__':
     quantized_gm = graph_module_insert_quantization_nodes(
         quantized_gm,
         customer_rules=[
-            QRule(r"conv1\.weight", 4, 0.1, None, False),
-            QRule(r"conv2\.weight", 1, 0.1, 0, False),
+            # QRule(r"conv1\.weight", 4, 0.1, None, False),
+            # QRule(r"conv2\.weight", 1, 0.1, 0, False),
+            QRule(r"\.weight$", 1, 0.1, 0, True),
             # {"pattern": r"0\.conv\.conv1\.weight", "bits_len": 4, "lr": 0.01, "channel_dim": 0},  # 自定义规则
         ],
     )
@@ -70,7 +71,7 @@ if __name__ == '__main__':
     print("\n--- 量化后的图结构 (最终的清晰版本!) ---")
     quantized_gm.graph.print_tabular()
 
-    exit(0)
+    # exit(0)
 
     gm_back = remove_quantization_nodes(quantized_gm)
     print("\n--- 反量化后的模型结构 (完全封装) ---")
@@ -100,7 +101,8 @@ if __name__ == '__main__':
         print("\n--- 量化后的导出的模型结构 ---")
         print(ex_quantized_gm)
         ex_quantized_gm.graph.print_tabular()
-        torch.onnx.export(ex_quantized_gm,
+
+        torch.onnx.export(ex_quantized_gm ,
                           input_tensor,
                           "../onnx_model/quantized_model.onnx",
                           input_names=["input"],

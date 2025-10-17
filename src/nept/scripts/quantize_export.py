@@ -2,12 +2,12 @@ from typing import List, Tuple, Dict
 import copy
 import torch
 from torch import nn
-from src.qnn.quantize import *
+# from nept.qnn.quantize import *
+from nept.qnn.quantize import DyQuantize
 from torch.fx import Tracer, GraphModule
 import onnx
 from onnx import shape_inference
 import re
-
 from dataclasses import dataclass, field
 from typing import Optional
 

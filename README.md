@@ -1,5 +1,38 @@
 # NanoEngine-Pytorch
 
+
+## 功能：
+1. 8bit 量化  √
+2. 8bit 量化通道级缩放因子  √
+3. 可学习缩放因子  √
+4. bn层支持  √
+5. 1bit量化  √
+6. 1bit量化支持通道级缩放因子  √
+7. 1bit量化支持可学习缩放因子  √
+8. 全程量化（不需要反量化层）  √
+9. 量化导出  √
+10. 量化模型推理
+11. 量化模型分析
+12. 增量流式维度推理   √
+
+
+## v1.0.0-alpha.1
+Initial commit
+## v1.0.0-alpha.2
+修复了低bit概率 导致loss不降低的问题 
+## v1.0.0-alpha.3 
+修复1bit连用的bug，添加非1bit的通道级别量化支持 
+## v1.0.0-alpha.4 
+提供了bn层的支持，1bit 量化的缩放因子可学习，1bit量化也支持了通道级缩放
+## v1.0.0-beta.1
+提供了pip安装方式
+
+
+
+
+
+
+
 ```shell
 python scripts/quantize_export.py
 python qnn/analysis.py

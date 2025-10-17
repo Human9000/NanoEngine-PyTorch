@@ -12,7 +12,7 @@ import pandas as pd
 from onnx import shape_inference
 from dataclasses import dataclass, field
 from typing import List, Any, Dict
-from qnn.quantizer import q_scale_k, q_packed_bits
+from .quantizer import q_scale_k, q_packed_bits
 
 
 # --- 新增: 定义中间表示 (IR) 的数据结构 ---

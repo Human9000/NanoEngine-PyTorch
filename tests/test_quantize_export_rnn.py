@@ -21,11 +21,22 @@ if __name__ == '__main__':
             self.conv2 = nn.Conv2d(16, 16, 1, stride=1, padding=0)
 
             self.bn = nn.BatchNorm2d(16)
+            self.gru = nn.GRUCell(16, 16)
 
         def forward(self, x):
             x = self.conv2(self.conv1(x))
-            y = self.bn(x)
-            return y
+            size = x.shape[2:]
+
+            x = x.flatten(2)
+            _h = None
+            y = []
+            for i in range(10):
+                _h = self.gru(x[:, :, i], _h)
+                y.append(_h)
+            x = torch.stack(y, 2).unflatten(2, (2, 5))
+            # y = self.bn(x)
+
+            return x
 
 
     class ComprehensiveModel(nn.Module):
@@ -33,6 +44,7 @@ if __name__ == '__main__':
             super().__init__()
             self.conv = Conv2()
             self.custom_param = nn.Parameter(torch.randn(1))
+
         def forward(self, x):
             x1 = self.conv(x)
             x = x1 + self.custom_param + torch.randn(1) + 2
@@ -45,6 +57,9 @@ if __name__ == '__main__':
     print("--- 原始模型 ---")
     print(model)
     model.forward(torch.randn(1, 3, 8, 8))
+    # quantized_gm = torch.compile(model)
+    # print(quantized_gm)
+    # exit()
     # 使用自定义的 DecomposeTracer 展开 model 的 graph 结构
     quantized_gm = translate_model_to_GraphModule(model)
     print("--- 图结构模型 ---")
@@ -69,8 +84,6 @@ if __name__ == '__main__':
 
     print("\n--- 量化后的图结构 (最终的清晰版本!) ---")
     quantized_gm.graph.print_tabular()
-
-    exit(0)
 
     gm_back = remove_quantization_nodes(quantized_gm)
     print("\n--- 反量化后的模型结构 (完全封装) ---")

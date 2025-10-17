@@ -222,10 +222,11 @@ class DyQuantize(nn.Module):
             scale = xabsmax
         else:
             scale = self.upper_bound / xabsmax
+        mask = xabsmax < 1e-6
         scale[scale > 2] *= 0.9  # init_scale 过大则提供一个向下移动的方向
         scale[scale < 0.5] /= 0.9  # init_scale 过小则提供一个向上移动的方向
-        scale[xabsmax < 1e-6] = self.scale  # xabsmax 过小则保持不变
         updated_scale = self.scale * (1 - self.lr) + self.lr * scale  # 用 init_scale 更新
+        updated_scale[mask] = self.scale[mask]  # xabsmax 过小则保持不变
 
         if self.scale.shape != updated_scale.shape:
             print("=====", self.name, self.scale.shape, updated_scale.shape, xabsmax.shape)

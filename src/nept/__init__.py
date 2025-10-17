@@ -13,5 +13,5 @@ from .qnn.debug_quantize_module import (
     QAvgPool2d
 )
 from .qnn.analysis import (
-    analyze_quantized_model,
+    main
 )

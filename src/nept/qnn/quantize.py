@@ -293,6 +293,7 @@ class ConstQuantize(nn.Module):
         return DyQuantize(self.bits_weight, lr, init_scale=self.scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        print(x, self.name)
         return const_quantize(x, self.bits_len, self.scale, self.name)
 
     def extra_repr(self) -> str:

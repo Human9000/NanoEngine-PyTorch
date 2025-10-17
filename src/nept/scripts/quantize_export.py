@@ -21,10 +21,10 @@ class QRule:
     use_channel_scale: bool = field(default=False)  # 是否使用通道级别缩放
 
     def __post_init__(self):
-        if self.bits_len == 1:
-            assert self.c_out_dim_index is not None, "1 bit 的 通道维度索引不能为None"
-        if self.use_channel_scale:
-            assert self.c_out_dim_index is not None, "使用通道缩放因子 的 通道维度索引不能为None"
+        # if self.bits_len == 1:
+        #     assert self.c_out_dim_index is not None, "1 bit 的 通道维度索引不能为None"
+        # if self.use_channel_scale:
+        #     assert self.c_out_dim_index is not None, "使用通道缩放因子 的 通道维度索引不能为None"
          
         # 编译一次，后面匹配更快
         if isinstance(self.pattern, str):
@@ -53,7 +53,8 @@ class DecomposeTracer(Tracer):
         ]:
             return False
         if m.__module__ in [
-            "src.qnn.quantize"
+            "src.qnn.quantize",
+            "torch.nn.modules.rnn",
         ]:
             return True
         # 对于其他 nn 模块，保持默认行为
@@ -133,17 +134,21 @@ def graph_module_insert_quantization_nodes(
             if len(original_users) > 0 and original_users[0].name.endswith("_q"):
                 continue
 
+            # 如果是函数调用取得的属性不需要量化
+            if node.op == "call_function" and "get" in node.name:
+                continue
             # if "running_mean" in node.name or "running_var" in node.name:
             #     continue
 
             # if "bn_bias" in node.name:
             #     continue
 
-            if "running_mean" in node.name:
-                continue
+            # if "running_mean" in node.name:
+            #     continue
 
             # if "bn_weight" in node.name:
             #     continue
+
 
             quantize_target = f"{node.name}_dq"
             quantize_name = f"{node.name}_q"

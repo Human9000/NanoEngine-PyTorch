@@ -134,9 +134,20 @@ def graph_module_insert_quantization_nodes(
             if len(original_users) > 0 and original_users[0].name.endswith("_q"):
                 continue
 
-            # 如果是函数调用取得的属性不需要量化
-            if node.op == "call_function" and "get" in node.name:
-                continue
+
+            # 如果是函数调用取得的属性如
+            if node.op == "call_function":
+                # size、shape等返回值是个size对象，则不需要量化
+                if "get" in node.name:
+                    continue
+                # relu 激活不需要再次量化
+                if "relu" in node.target.__str__():
+                    continue
+
+            if node.op == "call_method":
+                # view 不需要再次量化
+                if "view" in node.target:
+                    continue
             # if "running_mean" in node.name or "running_var" in node.name:
             #     continue
 

@@ -184,10 +184,12 @@ class DyQuantize(nn.Module):
                     if i != c_out_dim:
                         channel *= v
                 if c_out_dim is not None:
+                    # print(name, in_shape, c_out_dim)
                     if use_channel_scale:
                         self.scale_shape = [1, ] * len(in_shape)
-                        self.scale_shape[c_out_dim] = in_shape[c_out_dim]
-                        self.channel_max_dims = [i for i in range(len(in_shape)) if i != c_out_dim]
+                        if len(in_shape) > c_out_dim:
+                            self.scale_shape[c_out_dim] = in_shape[c_out_dim]
+                            self.channel_max_dims = [i for i in range(len(in_shape)) if i != c_out_dim]
             else:
                 self.in_shape = []
 
@@ -209,12 +211,29 @@ class DyQuantize(nn.Module):
     @torch.no_grad()
     def _update_scale(self, x):
         xabs = x.detach().abs()
+        if self.use_channel_scale is True:
+            # if len(self.channel_max_dims) > 0:
+            #     xabsmax = torch.amax(xabs, dim=self.channel_max_dims, keepdim=True)
+            # else:
+            #     xabsmax = xabs
+            xabsmax = xabs
+            ndim = x.dim()
+            odim = (ndim + self.c_out_dim) % ndim
+            # print(ndim, odim)
+            for i in range(ndim):
+                if i != odim:
+                    xabsmax = torch.amax(xabsmax,dim=i, keepdim=True)
 
-        if self.use_channel_scale is not False:
-            if len(self.channel_max_dims) > 0:
-                xabsmax = torch.amax(xabs, dim=self.channel_max_dims, keepdim=True)
-            else:
-                xabsmax = xabs
+            # print(self.name,
+            #       xabsmax.shape,
+            #       self.scale.shape,
+            #       )
+
+
+            if sum(xabsmax.shape) != sum(self.scale.shape):
+                self.scale = self.scale * torch.ones_like(xabsmax)
+            if xabsmax.shape != self.scale.shape:
+                xabsmax = xabsmax.reshape_as(self.scale)
         else:
             xabsmax = xabs.max()
 
@@ -226,6 +245,8 @@ class DyQuantize(nn.Module):
         scale[scale > 2] *= 0.9  # init_scale 过大则提供一个向下移动的方向
         scale[scale < 0.5] /= 0.9  # init_scale 过小则提供一个向上移动的方向
         updated_scale = self.scale * (1 - self.lr) + self.lr * scale  # 用 init_scale 更新
+
+        # print(self.name,self.use_channel_scale, mask.shape, self.scale.shape)
         updated_scale[mask] = self.scale[mask]  # xabsmax 过小则保持不变
 
         if self.scale.shape != updated_scale.shape:
@@ -247,19 +268,19 @@ class DyQuantize(nn.Module):
 
         self.count += 1
 
-        if self.bits_len == 8:
-            s0 = self.scale.item()
-            s = self.get_exp_clip_log2_scale().item()
+        if self.bits_len == 1:
+            s0 = self.scale.max().item()
+            s = self.get_exp_clip_log2_scale().max().item()
             # _fake_q_scale(x, 8, self.acc.get_exp_clip_log2_scale(), )
             if self.count % 100 == 1:
-                if "bn" in self.name:
+                # if "bn" in self.name:
                     print(
                         self.count,
-                        self.name,
-                        x.abs().max().item(),
-                        x.abs().max().item() * s,
-                        s0,
-                        s,
+                        "\t%-20s"%self.name,
+                        "\t%5.1f " % x.abs().max().item(),
+                        "\t%5.1f " %(x.abs().max().item() * s),
+                        "\t%5.1f " % s0,
+                        "\t%5.1f " % s,
                     )
         return q
 

@@ -116,7 +116,7 @@ def graph_module_insert_quantization_nodes(
             QRule(r".", bits_len=8, lr=0.1, ),  # 默认规则
             QRule(r"function get", bits_len=32, ),  # 默认规则
             QRule(r"function relu", bits_len=32, ),  # 默认规则
-            # QRule(r"function silu", bits_len=32, ),  # 默认规则
+            QRule(r"split", bits_len=32, ),  # 默认规则
             QRule(r"\.weight$", bits_len=8, ),  # 默认规则
             QRule(r"\.bias$", bits_len=8, )  # 默认规则
         ]

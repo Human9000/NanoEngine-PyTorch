@@ -23,7 +23,12 @@ def _fake_q_scale(
         name: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert bits_weight in [1, 2, 4, 8], "bits_len must be 1, 2, 4, or 8"
-    device, dtype = x.device, x.dtype
+    try:
+        device, dtype = x.device, x.dtype
+    except Exception as e:
+        print(e)
+        print(name)
+        exit(0)
     scale = scale.to(device)
     if bits_weight == 1:
         q = torch.where(x >= 0,
@@ -207,7 +212,7 @@ class DyQuantize(nn.Module):
         self.count = 0
 
     def to_const(self):
-        print(self.name, self.scale_shape, self.scale.shape)
+        # print(self.name, self.scale_shape, self.scale.shape)
         return ConstQuantize(self.bits_len, self.get_exp_clip_log2_scale(), self.name)
 
     @torch.no_grad()

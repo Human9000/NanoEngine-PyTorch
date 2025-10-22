@@ -28,7 +28,9 @@ share/python-wheels/
 MANIFEST
 temp/
 onnx_model/*
-examples/
+#examples/
+*.onnx
+*.pt
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

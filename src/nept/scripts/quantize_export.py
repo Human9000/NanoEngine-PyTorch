@@ -114,6 +114,9 @@ def graph_module_insert_quantization_nodes(
         # 正则表达式自定义可训练参数的量化规则， 若 channel_dim = None, 则采用 tensor init_scale，否则采用 channel init_scale
         default_rules = [
             QRule(r".", bits_len=8, lr=0.1, ),  # 默认规则
+            QRule(r"function get", bits_len=32, ),  # 默认规则
+            QRule(r"function relu", bits_len=32, ),  # 默认规则
+            # QRule(r"function silu", bits_len=32, ),  # 默认规则
             QRule(r"\.weight$", bits_len=8, ),  # 默认规则
             QRule(r"\.bias$", bits_len=8, )  # 默认规则
         ]
@@ -134,38 +137,20 @@ def graph_module_insert_quantization_nodes(
             if len(original_users) > 0 and original_users[0].name.endswith("_q"):
                 continue
 
-
-            # 如果是函数调用取得的属性如
-            if node.op == "call_function":
-                # size、shape等返回值是个size对象，则不需要量化
-                if "get" in node.name:
-                    continue
-                # relu 激活不需要再次量化
-                if "relu" in node.target.__str__():
-                    continue
-
             if node.op == "call_method":
                 # view 不需要再次量化
                 if "view" in node.target:
                     continue
-            # if "running_mean" in node.name or "running_var" in node.name:
-            #     continue
-
-            # if "bn_bias" in node.name:
-            #     continue
-
-            # if "running_mean" in node.name:
-            #     continue
-
-            # if "bn_weight" in node.name:
-            #     continue
-
 
             quantize_target = f"{node.name}_dq"
             quantize_name = f"{node.name}_q"
             bits, lr, scale_shape, c_dim, use_channel_scale = get_quantization_info(quantization_gm,
                                                                                     str(node.target),
                                                                                     default_rules + customer_rules)
+
+            if bits > 8:
+                continue
+
 
             quantize = DyQuantize(bits,
                                   lr,
@@ -249,7 +234,6 @@ def ex_quantize_model_fully_encapsulated(model: GraphModule):
             model.add_submodule(cq_name, dq_module.to_const())
             model.delete_submodule(dq_name)
             node.target = cq_name
-            # delattr(model, dq_name)
 
     # 4. 别忘了重新生成代码
     model.graph.lint()

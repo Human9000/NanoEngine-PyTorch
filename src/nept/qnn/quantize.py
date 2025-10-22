@@ -1,3 +1,4 @@
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,6 +11,7 @@ import copy
 import numpy as np
 import math
 import pandas as pd
+from torch.utils.checkpoint import checkpoint
 
 
 # --- Base Quantization Functions (unchanged) ---
@@ -22,24 +24,23 @@ def _fake_q_scale(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert bits_weight in [1, 2, 4, 8], "bits_len must be 1, 2, 4, or 8"
     device, dtype = x.device, x.dtype
-
+    scale = scale.to(device)
     if bits_weight == 1:
         q = torch.where(x >= 0,
-                        torch.ones_like(x, dtype=torch.float32),
-                        -torch.ones_like(x, dtype=torch.float32)) * scale
-        # mask = (x.abs() <= scale)
+                        torch.ones_like(x, dtype=torch.float32, device=device),
+                        -torch.ones_like(x, dtype=torch.float32, device=device)) * scale
         mask = (x.abs() <= 1)
     else:
         trunc_x_scale = torch.trunc(x * scale)
-        q_val = torch.clamp(
+        q = torch.clamp(
             trunc_x_scale,
             - 2 ** (bits_weight - 1),
             2 ** (bits_weight - 1) - 1,
         )
-        q = q_val / scale
-        mask = (q_val == trunc_x_scale)
+        q /= scale
+        mask = (q == trunc_x_scale)
 
-    return q.to(dtype=dtype, device=device), mask.detach()
+    return q, mask
     # return x, mask.detach()
 
 
@@ -110,7 +111,8 @@ class DyQuantizedWrapper(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> Tuple[Any, ...]:
-        return grad_output * ctx.q_mask, None, None, None
+        grad_output *= ctx.q_mask
+        return grad_output, None, None, None
 
 
 class ConstQuantizedWrapper(torch.autograd.Function):
@@ -212,23 +214,12 @@ class DyQuantize(nn.Module):
     def _update_scale(self, x):
         xabs = x.detach().abs()
         if self.use_channel_scale is True:
-            # if len(self.channel_max_dims) > 0:
-            #     xabsmax = torch.amax(xabs, dim=self.channel_max_dims, keepdim=True)
-            # else:
-            #     xabsmax = xabs
             xabsmax = xabs
             ndim = x.dim()
             odim = (ndim + self.c_out_dim) % ndim
-            # print(ndim, odim)
             for i in range(ndim):
                 if i != odim:
-                    xabsmax = torch.amax(xabsmax,dim=i, keepdim=True)
-
-            # print(self.name,
-            #       xabsmax.shape,
-            #       self.scale.shape,
-            #       )
-
+                    xabsmax = torch.amax(xabsmax, dim=i, keepdim=True)
 
             if sum(xabsmax.shape) != sum(self.scale.shape):
                 self.scale = self.scale * torch.ones_like(xabsmax)
@@ -244,6 +235,7 @@ class DyQuantize(nn.Module):
         mask = xabsmax < 1e-6
         scale[scale > 2] *= 0.9  # init_scale 过大则提供一个向下移动的方向
         scale[scale < 0.5] /= 0.9  # init_scale 过小则提供一个向上移动的方向
+
         updated_scale = self.scale * (1 - self.lr) + self.lr * scale  # 用 init_scale 更新
 
         # print(self.name,self.use_channel_scale, mask.shape, self.scale.shape)
@@ -263,26 +255,38 @@ class DyQuantize(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.training:
+            # checkpoint(self._update_scale, x)
             self._update_scale(x)
-        q = dy_quantize(x, self.bits_len, self.get_exp_clip_log2_scale(), self.name)
 
-        self.count += 1
+        # t0 = time.time()
+        # dy_quantize(torch.zeros(1,1,1,1).to(x.device),
+        return dy_quantize(x,
+                           self.bits_len,
+                           self.get_exp_clip_log2_scale(),
+                           self.name
+                           )
+        # t1 = time.time()
+        # print(self.name, x.shape, t1 - t0)
+        # return x
+        # q = dy_quantize(x, self.bits_len, self.get_exp_clip_log2_scale(), self.name)
 
-        if self.bits_len == 1:
-            s0 = self.scale.max().item()
-            s = self.get_exp_clip_log2_scale().max().item()
-            # _fake_q_scale(x, 8, self.acc.get_exp_clip_log2_scale(), )
-            if self.count % 100 == 1:
-                # if "bn" in self.name:
-                    print(
-                        self.count,
-                        "\t%-20s"%self.name,
-                        "\t%5.1f " % x.abs().max().item(),
-                        "\t%5.1f " %(x.abs().max().item() * s),
-                        "\t%5.1f " % s0,
-                        "\t%5.1f " % s,
-                    )
-        return q
+        # self.count += 1
+        #
+        # if self.bits_len == 1:
+        #     s0 = self.scale.max().item()
+        #     s = self.get_exp_clip_log2_scale().max().item()
+        #     # _fake_q_scale(x, 8, self.acc.get_exp_clip_log2_scale(), )
+        #     if self.count % 100 == 1:
+        #         # if "bn" in self.name:
+        #             print(
+        #                 self.count,
+        #                 "\t%-40s"%self.name,
+        #                 "\t%5.1f " % x.abs().max().item(),
+        #                 "\t%5.1f " %(x.abs().max().item() * s),
+        #                 "\t%5.1f " % s0,
+        #                 "\t%5.1f " % s,
+        #             )
+        # return q
 
     def extra_repr(self) -> str:
         return f'bits_len={self.bits_len}, ' \
@@ -314,7 +318,7 @@ class ConstQuantize(nn.Module):
         return DyQuantize(self.bits_weight, lr, init_scale=self.scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        print(x, self.name)
+        # print(x, self.name)
         return const_quantize(x, self.bits_len, self.scale, self.name)
 
     def extra_repr(self) -> str:
